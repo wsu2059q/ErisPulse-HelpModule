@@ -1,25 +1,34 @@
 from ErisPulse import sdk
-from ErisPulse.Core.Event import command, message
+from ErisPulse.Core.Event import command
 from ErisPulse.Core import config
-from typing import Dict, List, Optional
+from ErisPulse.Core.Bases import BaseModule
+from typing import Dict, List
 
-class HelpModule:
+class HelpModule(BaseModule):
     def __init__(self):
         self.sdk = sdk
         self.logger = sdk.logger.get_child("HelpModule")
-        self._register_commands()
+        self.command_list = []
         
     @staticmethod
     def should_eager_load():
         return True
     
+    async def on_load(self, event):
+        self._register_commands()
+        self.logger.info("HelpModule 已加载")
+        return True
+        
+    async def on_unload(self, event):
+        self._unregister_commands()
+        self.logger.info("HelpModule 已卸载")
+        return True
+
     def _get_config(self):
-        """获取模块配置，如果不存在则创建默认配置"""
         module_config = config.getConfig("HelpModule")
         if not module_config:
             default_config = {
                 "show_hidden_commands": False,
-                "style": "simple",
                 "group_commands": True
             }
             config.setConfig("HelpModule", default_config)
@@ -33,16 +42,57 @@ class HelpModule:
         return command_config.get("prefix", "/")
         
     def _register_commands(self):
-        prefix = self._get_command_prefix()
-        
-        @command(
+        self.help_command_func = self._create_help_command()
+        command(
             "help", 
-            aliases=["h", "帮助", "命令帮助"], 
+            aliases=["h", "帮助"], 
             help="显示帮助信息",
-            usage="help [命令名] - 显示所有命令或指定命令的详细信息"
-        )
+            usage="help [序号] - 显示命令列表或查看指定序号的命令详情"
+        )(self.help_command_func)
+
+    def _unregister_commands(self):
+        if hasattr(self, 'help_command_func'):
+            command.unregister(self.help_command_func)
+    
+    def _create_help_command(self):
         async def help_command(event):
             await self._handle_help_command(event)
+        return help_command
+
+    def _build_command_list(self) -> List[Dict]:
+        self.command_list = []
+        module_config = self._get_config()
+        show_hidden = module_config.get("show_hidden_commands", False)
+        
+        if show_hidden:
+            all_commands = command.get_commands()
+            for cmd_name in all_commands:
+                cmd_info = command.get_command(cmd_name)
+                if cmd_info and cmd_name == cmd_info.get("main_name"):
+                    self.command_list.append({
+                        "name": cmd_name,
+                        "info": cmd_info
+                    })
+        else:
+            visible_commands = command.get_visible_commands()
+            for cmd_name in visible_commands:
+                cmd_info = command.get_command(cmd_name)
+                if cmd_info and cmd_name == cmd_info.get("main_name"):
+                    self.command_list.append({
+                        "name": cmd_name,
+                        "info": cmd_info
+                    })
+        
+        return self.command_list
+
+    def _group_commands_by_category(self, commands: List[Dict]) -> Dict[str, List]:
+        grouped = {}
+        for cmd in commands:
+            group = cmd["info"].get("group") or "default"
+            if group not in grouped:
+                grouped[group] = []
+            grouped[group].append(cmd)
+        return grouped
 
     async def _handle_help_command(self, event: Dict) -> None:
         try:
@@ -54,263 +104,110 @@ class HelpModule:
                 target_type = "user"
                 target_id = event["user_id"]
                 
-            # 获取命令参数
             args = event.get("command", {}).get("args", [])
-            
-            # 获取适配器实例
             adapter = getattr(sdk.adapter, platform)
             
-            if args:
-                # 查看特定命令的详细帮助
-                cmd_name = args[0].lower()
-                help_text = self._get_command_detail(cmd_name)
-            else:
-                # 显示所有命令的简要帮助
-                # 根据配置决定是否显示隐藏命令
-                module_config = self._get_config()
-                show_hidden = module_config.get("show_hidden_commands", False)
-                
-                if show_hidden:
-                    # 显示所有命令（包括隐藏命令）
-                    commands_info = {}
-                    all_commands = command.get_commands()
-                    for cmd_name in all_commands:
-                        # 只获取主命令，避免重复显示别名
-                        cmd_info = command.get_command(cmd_name)
-                        if cmd_info and cmd_name == cmd_info.get("main_name"):
-                            commands_info[cmd_name] = cmd_info
-                else:
-                    # 只显示可见命令
-                    commands_info = {}
-                    visible_commands = command.get_visible_commands()
-                    for cmd_name in visible_commands:
-                        cmd_info = command.get_command(cmd_name)
-                        if cmd_info:
-                            commands_info[cmd_name] = cmd_info
-                            
-                help_text = self._format_help_text(commands_info, show_hidden)
+            commands = self._build_command_list()
             
-            # 发送帮助信息
+            if args:
+                try:
+                    index = int(args[0]) - 1
+                    if 0 <= index < len(commands):
+                        help_text = self._format_command_detail(commands[index])
+                    else:
+                        help_text = f"错误: 序号超出范围，请输入 1-{len(commands)} 之间的序号"
+                except ValueError:
+                    help_text = "错误: 请输入有效的序号"
+            else:
+                help_text = self._format_command_list(commands)
+            
             await adapter.Send.To(target_type, target_id).Text(help_text)
         except Exception as e:
             self.logger.error(f"处理帮助命令时出错: {e}")
-            if 'adapter' in locals():
-                error_msg = "处理帮助命令时发生错误，请稍后再试"
-                await adapter.Send.To(target_type, target_id).Text(error_msg)
 
-    def _format_help_text(self, commands_info: Dict[str, Dict], show_hidden: bool = False) -> str:
-        prefix = self._get_command_prefix()
-        module_config = self._get_config()
-        style = module_config.get("style", "simple")
-        
-        if style == "detailed":
-            return self._format_detailed_help_text(commands_info, show_hidden)
-        else:
-            return self._format_simple_help_text(commands_info, show_hidden)
-    
-    def _format_simple_help_text(self, commands_info: Dict[str, Dict], show_hidden: bool = False) -> str:
+    def _format_command_list(self, commands: List[Dict]) -> str:
         prefix = self._get_command_prefix()
         module_config = self._get_config()
         
-        help_lines = [
-            "=" * 50,
-            "命令帮助",
-            "=" * 50,
-        ]
-        
-        if show_hidden:
-            help_lines.append("[注意] 当前显示所有命令（包括隐藏命令）")
-        
-        help_lines.append(f"使用 '{prefix}help <命令名>' 查看具体命令的详细用法")
-        help_lines.append("")
-        
-        # 根据配置决定是否按组显示命令
-        if module_config.get("group_commands", True):
-            # 按命令组分组
-            grouped_commands = self._group_commands_by_category(commands_info)
-            
-            # 添加默认组的命令
-            if "default" in grouped_commands:
-                help_lines.append("[通用命令]")
-                for cmd_name, cmd_info in grouped_commands["default"]:
-                    help_lines.append(self._format_command_brief(cmd_name, cmd_info, prefix))
-                help_lines.append("")
-            
-            # 添加其他组的命令
-            for group, cmds in grouped_commands.items():
-                if group == "default":
-                    continue
-                # 安全处理组名
-                group_name = str(group) if group else "其他"
-                help_lines.append(f"[{group_name}命令]")
-                for cmd_name, cmd_info in cmds:
-                    help_lines.append(self._format_command_brief(cmd_name, cmd_info, prefix))
-                help_lines.append("")
-        else:
-            # 不分组显示所有命令
-            help_lines.append("[所有命令]")
-            for cmd_name, cmd_info in commands_info.items():
-                help_lines.append(self._format_command_brief(cmd_name, cmd_info, prefix))
-            help_lines.append("")
-        
-        # 添加页脚信息
-        help_lines.append("-" * 50)
-        help_lines.append(f"共 {len(commands_info)} 个可用命令")
-        help_lines.append("=" * 50)
-        
-        return "\n".join(help_lines)
-    
-    def _format_detailed_help_text(self, commands_info: Dict[str, Dict], show_hidden: bool = False) -> str:
-        prefix = self._get_command_prefix()
-        module_config = self._get_config()
-        
-        help_lines = [
-            "=" * 50,
-            "命令帮助",
-            "=" * 50,
-        ]
-        
-        if show_hidden:
-            help_lines.append("[注意] 当前显示所有命令（包括隐藏命令）")
-        
-        help_lines.append(f"使用 '{prefix}help <命令名>' 查看具体命令的详细用法")
-        help_lines.append("")
-        
-        # 根据配置决定是否按组显示命令
-        if module_config.get("group_commands", True):
-            # 按命令组分组
-            grouped_commands = self._group_commands_by_category(commands_info)
-            
-            # 添加默认组的命令
-            if "default" in grouped_commands:
-                help_lines.append("[通用命令]")
-                for cmd_name, cmd_info in grouped_commands["default"]:
-                    help_lines.append(self._format_command_detailed(cmd_name, cmd_info, prefix))
-                help_lines.append("")
-            
-            # 添加其他组的命令
-            for group, cmds in grouped_commands.items():
-                if group == "default":
-                    continue
-                # 安全处理组名
-                group_name = str(group) if group else "其他"
-                help_lines.append(f"[{group_name}命令]")
-                for cmd_name, cmd_info in cmds:
-                    help_lines.append(self._format_command_detailed(cmd_name, cmd_info, prefix))
-                help_lines.append("")
-        else:
-            # 不分组显示所有命令
-            help_lines.append("[所有命令]")
-            for cmd_name, cmd_info in commands_info.items():
-                help_lines.append(self._format_command_detailed(cmd_name, cmd_info, prefix))
-            help_lines.append("")
-        
-        # 添加页脚信息
-        help_lines.append("-" * 50)
-        help_lines.append(f"共 {len(commands_info)} 个可用命令")
-        help_lines.append("=" * 50)
-        
-        return "\n".join(help_lines)
-    
-    def _group_commands_by_category(self, commands_info: Dict[str, Dict]) -> Dict[str, List]:
-        grouped_commands = {}
-        for cmd_name, cmd_info in commands_info.items():
-            group = cmd_info.get("group")
-            group = "default" if group is None else group
-            if group not in grouped_commands:
-                grouped_commands[group] = []
-            grouped_commands[group].append((cmd_name, cmd_info))
-        return grouped_commands
-    
-    def _format_command_brief(self, cmd_name: str, cmd_info: Dict, prefix: str) -> str:
-        # 主命令名
-        formatted = f"  {prefix}{cmd_name}"
-        
-        # 帮助文本
-        help_text = cmd_info.get("help", "暂无描述")
-        formatted += f" - {help_text}"
-        
-        return formatted
-    
-    def _format_command_detailed(self, cmd_name: str, cmd_info: Dict, prefix: str) -> str:
-        # 主命令名
-        formatted = f"  {prefix}{cmd_name}"
-        
-        # 帮助文本
-        help_text = cmd_info.get("help", "暂无描述")
-        formatted += f"\n    描述: {help_text}"
-        
-        # 别名信息
-        aliases = []
-        for alias, main_name in command.aliases.items():
-            if main_name == cmd_info['main_name'] and alias != cmd_info['main_name']:
-                aliases.append(alias)
-        
-        if aliases:
-            formatted += f"\n    别名: {', '.join(f'{prefix}{a}' for a in aliases)}"
-        
-        # 使用示例
-        if cmd_info.get("usage"):
-            usage = cmd_info['usage'].replace("/", prefix)
-            formatted += f"\n    用法: {usage}"
-            
-        # 权限信息
-        if cmd_info.get("permission"):
-            formatted += f"\n    权限: 需要特殊权限"
-            
-        # 隐藏状态
-        if cmd_info.get("hidden"):
-            formatted += f"\n    状态: 隐藏命令"
-        
-        return formatted
-    
-    def _get_command_detail(self, cmd_name: str) -> str:
-        prefix = self._get_command_prefix()
-        
-        # 查找命令(支持别名) 使用安全访问方式
-        cmd_info = command.get_command(cmd_name)
-        
-        if not cmd_info:
-            return f"错误: 未找到命令 '{cmd_name}'"
-        
-        # 构建详细帮助
         lines = [
-            "=" * 50,
-            f"命令详情: {prefix}{cmd_info['main_name']}",
-            "=" * 50,
-            f"描述: {cmd_info.get('help', '暂无描述')}"
+            "命令帮助",
+            "-" * 10,
+            f"使用 '{prefix}help <序号>' 查看命令详情",
+            ""
         ]
         
-        # 别名信息
+        if module_config.get("group_commands", True):
+            grouped = self._group_commands_by_category(commands)
+            
+            # 默认组
+            if "default" in grouped:
+                lines.append("[通用命令]")
+                for idx, cmd in enumerate(grouped["default"], 1):
+                    name = cmd["name"]
+                    help_text = cmd["info"].get("help", "暂无描述")
+                    lines.append(f"{idx}. {prefix}{name} - {help_text}")
+                lines.append("")
+            
+            # 其他组
+            for group, cmds in grouped.items():
+                if group == "default":
+                    continue
+                group_name = str(group) if group else "其他"
+                lines.append(f"[{group_name}命令]")
+                for idx, cmd in enumerate(cmds, 1):
+                    name = cmd["name"]
+                    help_text = cmd["info"].get("help", "暂无描述")
+                    lines.append(f"{idx}. {prefix}{name} - {help_text}")
+                lines.append("")
+        else:
+            lines.append("[所有命令]")
+            for idx, cmd in enumerate(commands, 1):
+                name = cmd["name"]
+                help_text = cmd["info"].get("help", "暂无描述")
+                lines.append(f"{idx}. {prefix}{name} - {help_text}")
+            lines.append("")
+        
+        lines.append("-" * 10)
+        lines.append(f"共 {len(commands)} 个可用命令")
+        
+        return "\n".join(lines)
+    
+    def _format_command_detail(self, cmd: Dict) -> str:
+        prefix = self._get_command_prefix()
+        name = cmd["name"]
+        info = cmd["info"]
+        
+        lines = [
+            f"命令详情: {prefix}{name}",
+            "-" * 10,
+            f"描述: {info.get('help', '暂无描述')}"
+        ]
+        
+        # 别名
         aliases = []
         for alias, main_name in command.aliases.items():
-            if main_name == cmd_info['main_name'] and alias != cmd_info['main_name']:
+            if main_name == info['main_name'] and alias != info['main_name']:
                 aliases.append(alias)
         
         if aliases:
             lines.append(f"别名: {', '.join(f'{prefix}{a}' for a in aliases)}")
         
-        # 使用示例
-        if cmd_info.get("usage"):
-            lines.append("")
-            lines.append("使用示例:")
-            usage = cmd_info['usage'].replace("/", prefix)
-            lines.append(f"  {usage}")
+        # 用法
+        if info.get("usage"):
+            lines.append(f"用法: {info['usage'].replace('/', prefix)}")
         
-        # 权限信息
-        if cmd_info.get("permission"):
-            lines.append("")
-            lines.append("权限: 需要特殊权限才能使用此命令")
+        # 权限
+        if info.get("permission"):
+            lines.append("权限: 需要特殊权限")
         
         # 隐藏状态
-        if cmd_info.get("hidden"):
-            lines.append("")
-            lines.append("注意: 这是一个隐藏命令，不会在常规帮助中显示")
-            
-        # 显示命令组信息
-        if cmd_info.get("group"):
-            lines.append("")
-            lines.append(f"分组: {cmd_info['group']}")
+        if info.get("hidden"):
+            lines.append("状态: 隐藏命令")
         
-        lines.append("=" * 50)
+        # 分组
+        if info.get("group"):
+            lines.append(f"分组: {info['group']}")
+        
+        lines.append("-" * 10)
+        
         return "\n".join(lines)
