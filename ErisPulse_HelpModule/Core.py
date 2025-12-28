@@ -9,6 +9,7 @@ class HelpModule(BaseModule):
         self.sdk = sdk
         self.logger = sdk.logger.get_child("HelpModule")
         self.command_list = []
+        self.command_map = {}
         
     @staticmethod
     def should_eager_load():
@@ -111,9 +112,9 @@ class HelpModule(BaseModule):
             
             if args:
                 try:
-                    index = int(args[0]) - 1
-                    if 0 <= index < len(commands):
-                        help_text = self._format_command_detail(commands[index])
+                    index = int(args[0])
+                    if index in self.command_map:
+                        help_text = self._format_command_detail(self.command_map[index])
                     else:
                         help_text = f"错误: 序号超出范围，请输入 1-{len(commands)} 之间的序号"
                 except ValueError:
@@ -129,6 +130,10 @@ class HelpModule(BaseModule):
         prefix = self._get_command_prefix()
         module_config = self._get_config()
         
+        # 重置命令映射
+        self.command_map = {}
+        global_idx = 1
+        
         lines = [
             "命令帮助",
             "-" * 10,
@@ -142,10 +147,12 @@ class HelpModule(BaseModule):
             # 默认组
             if "default" in grouped:
                 lines.append("[通用命令]")
-                for idx, cmd in enumerate(grouped["default"], 1):
+                for cmd in grouped["default"]:
                     name = cmd["name"]
                     help_text = cmd["info"].get("help", "暂无描述")
-                    lines.append(f"{idx}. {prefix}{name} - {help_text}")
+                    lines.append(f"{global_idx}. {prefix}{name} - {help_text}")
+                    self.command_map[global_idx] = cmd
+                    global_idx += 1
                 lines.append("")
             
             # 其他组
@@ -154,17 +161,21 @@ class HelpModule(BaseModule):
                     continue
                 group_name = str(group) if group else "其他"
                 lines.append(f"[{group_name}命令]")
-                for idx, cmd in enumerate(cmds, 1):
+                for cmd in cmds:
                     name = cmd["name"]
                     help_text = cmd["info"].get("help", "暂无描述")
-                    lines.append(f"{idx}. {prefix}{name} - {help_text}")
+                    lines.append(f"{global_idx}. {prefix}{name} - {help_text}")
+                    self.command_map[global_idx] = cmd
+                    global_idx += 1
                 lines.append("")
         else:
             lines.append("[所有命令]")
-            for idx, cmd in enumerate(commands, 1):
+            for cmd in commands:
                 name = cmd["name"]
                 help_text = cmd["info"].get("help", "暂无描述")
-                lines.append(f"{idx}. {prefix}{name} - {help_text}")
+                lines.append(f"{global_idx}. {prefix}{name} - {help_text}")
+                self.command_map[global_idx] = cmd
+                global_idx += 1
             lines.append("")
         
         lines.append("-" * 10)
@@ -199,10 +210,6 @@ class HelpModule(BaseModule):
         # 权限
         if info.get("permission"):
             lines.append("权限: 需要特殊权限")
-        
-        # 隐藏状态
-        if info.get("hidden"):
-            lines.append("状态: 隐藏命令")
         
         # 分组
         if info.get("group"):
