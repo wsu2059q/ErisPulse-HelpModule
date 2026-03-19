@@ -2,7 +2,8 @@ from ErisPulse import sdk
 from ErisPulse.Core.Event import command
 from ErisPulse.Core import config
 from ErisPulse.Core.Bases import BaseModule
-from typing import Dict, List
+from typing import Dict, List, Optional
+from .templates import HelpTemplates
 
 class HelpModule(BaseModule):
     def __init__(self):
@@ -101,120 +102,103 @@ class HelpModule(BaseModule):
             if event.get("detail_type") == "group":
                 target_type = "group"
                 target_id = event["group_id"]
-            else:
+            elif event.get("detail_type") == "private" or event.get("detail_type") == "user":
                 target_type = "user"
                 target_id = event["user_id"]
+            else:
+                target_type = event.get("detail_type")
+                target_id = event.get("target_id")
                 
             args = event.get("command", {}).get("args", [])
             adapter = getattr(sdk.adapter, platform)
             
             commands = self._build_command_list()
+            module_config = self._get_config()
             
             if args:
+                # 显示命令详情
                 try:
                     index = int(args[0])
                     if index in self.command_map:
-                        help_text = self._format_command_detail(self.command_map[index])
+                        # 使用模板构建命令详情
+                        templates = HelpTemplates.build_command_detail(
+                            self.command_map[index],
+                            self._get_command_prefix()
+                        )
+                        help_content = self._select_best_format(platform, templates)
                     else:
-                        help_text = f"错误: 序号超出范围，请输入 1-{len(commands)} 之间的序号"
+                        # 使用错误模板
+                        templates = HelpTemplates.build_error(
+                            "序号超出范围",
+                            f"请输入 1-{len(commands)} 之间的序号"
+                        )
+                        help_content = self._select_best_format(platform, templates)
                 except ValueError:
-                    help_text = "错误: 请输入有效的序号"
+                    templates = HelpTemplates.build_error(
+                        "参数错误",
+                        "请输入有效的序号"
+                    )
+                    help_content = self._select_best_format(platform, templates)
             else:
-                help_text = self._format_command_list(commands)
+                # 显示命令列表
+                templates = HelpTemplates.build_help_list(
+                    commands,
+                    self.command_map,
+                    self._get_command_prefix(),
+                    module_config.get("group_commands", True)
+                )
+                help_content = self._select_best_format(platform, templates)
             
-            await adapter.Send.To(target_type, target_id).Text(help_text)
+            # 发送消息
+            await self._send_with_format(adapter, target_type, target_id, help_content)
         except Exception as e:
-            self.logger.error(f"处理帮助命令时出错: {e}")
-
-    def _format_command_list(self, commands: List[Dict]) -> str:
-        prefix = self._get_command_prefix()
-        module_config = self._get_config()
-        
-        # 重置命令映射
-        self.command_map = {}
-        global_idx = 1
-        
-        lines = [
-            "命令帮助",
-            "-" * 10,
-            f"使用 '{prefix}help <序号>' 查看命令详情",
-            ""
-        ]
-        
-        if module_config.get("group_commands", True):
-            grouped = self._group_commands_by_category(commands)
-            
-            # 默认组
-            if "default" in grouped:
-                lines.append("[通用命令]")
-                for cmd in grouped["default"]:
-                    name = cmd["name"]
-                    help_text = cmd["info"].get("help", "暂无描述")
-                    lines.append(f"{global_idx}. {prefix}{name} - {help_text}")
-                    self.command_map[global_idx] = cmd
-                    global_idx += 1
-                lines.append("")
-            
-            # 其他组
-            for group, cmds in grouped.items():
-                if group == "default":
-                    continue
-                group_name = str(group) if group else "其他"
-                lines.append(f"[{group_name}命令]")
-                for cmd in cmds:
-                    name = cmd["name"]
-                    help_text = cmd["info"].get("help", "暂无描述")
-                    lines.append(f"{global_idx}. {prefix}{name} - {help_text}")
-                    self.command_map[global_idx] = cmd
-                    global_idx += 1
-                lines.append("")
-        else:
-            lines.append("[所有命令]")
-            for cmd in commands:
-                name = cmd["name"]
-                help_text = cmd["info"].get("help", "暂无描述")
-                lines.append(f"{global_idx}. {prefix}{name} - {help_text}")
-                self.command_map[global_idx] = cmd
-                global_idx += 1
-            lines.append("")
-        
-        lines.append("-" * 10)
-        lines.append(f"共 {len(commands)} 个可用命令")
-        
-        return "\n".join(lines)
+            self.logger.error(f"处理帮助命令时出错: {e}", exc_info=True)
     
-    def _format_command_detail(self, cmd: Dict) -> str:
-        prefix = self._get_command_prefix()
-        name = cmd["name"]
-        info = cmd["info"]
+    def _select_best_format(self, platform: str, templates: Dict[str, str]) -> tuple:
+        """
+        根据平台支持的发送方法选择最佳格式
+        优先使用 list_sends，不支持时使用 hasattr 兜底
         
-        lines = [
-            f"命令详情: {prefix}{name}",
-            "-" * 10,
-            f"描述: {info.get('help', '暂无描述')}"
-        ]
+        返回: (format_name, content)
+        """
+        # 首先尝试使用 list_sends（推荐方式）
+        try:
+            supported_methods = sdk.adapter.list_sends(platform)
+            
+            # 优先级: Html > Markdown > Text
+            if "Html" in supported_methods:
+                return ("Html", templates["html"])
+            elif "Markdown" in supported_methods:
+                return ("Markdown", templates["markdown"])
+            else:
+                return ("Text", templates["text"])
+        except Exception as e:
+            self.logger.warning(f"list_sends 检测失败: {e}，尝试使用 hasattr 兜底")
+            
+            # 使用 hasattr 作为兜底方案
+            adapter = getattr(sdk.adapter, platform)
+            send_obj = adapter.Send if hasattr(adapter, "Send") else None
+            
+            if send_obj is None:
+                self.logger.warning(f"平台 {platform} 不支持 Send 接口，使用纯文本格式")
+                return ("Text", templates["text"])
+            
+            # 检查支持的方法
+            if hasattr(send_obj, "Html"):
+                return ("Html", templates["html"])
+            elif hasattr(send_obj, "Markdown"):
+                return ("Markdown", templates["markdown"])
+            else:
+                return ("Text", templates["text"])
+    
+    async def _send_with_format(self, adapter, target_type: str, target_id: str, 
+                                format_content: tuple) -> None:
+        format_name, content = format_content
         
-        # 别名
-        aliases = []
-        for alias, main_name in command.aliases.items():
-            if main_name == info['main_name'] and alias != info['main_name']:
-                aliases.append(alias)
-        
-        if aliases:
-            lines.append(f"别名: {', '.join(f'{prefix}{a}' for a in aliases)}")
-        
-        # 用法
-        if info.get("usage"):
-            lines.append(f"用法: {info['usage'].replace('/', prefix)}")
-        
-        # 权限
-        if info.get("permission"):
-            lines.append("权限: 需要特殊权限")
-        
-        # 分组
-        if info.get("group"):
-            lines.append(f"分组: {info['group']}")
-        
-        lines.append("-" * 10)
-        
-        return "\n".join(lines)
+        # 根据格式调用对应的发送方法
+        if format_name == "Html":
+            await adapter.Send.To(target_type, target_id).Html(content)
+        elif format_name == "Markdown":
+            await adapter.Send.To(target_type, target_id).Markdown(content)
+        else:  # Text
+            await adapter.Send.To(target_type, target_id).Text(content)
