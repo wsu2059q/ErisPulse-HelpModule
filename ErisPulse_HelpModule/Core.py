@@ -38,10 +38,19 @@ class HelpModule(BaseModule):
             return default_config
         return module_config
 
-    def _get_command_prefix(self) -> str:
+    def _get_all_prefixes(self) -> list:
+        """获取所有命令前缀列表"""
         event_config = config.getConfig("ErisPulse.event", {})
         command_config = event_config.get("command", {})
-        return command_config.get("prefix", "/")
+        prefix = command_config.get("prefix", "/")
+        if isinstance(prefix, list):
+            return [str(p) for p in prefix] if prefix else ["/"]
+        return [str(prefix)]
+
+    def _get_command_prefix(self) -> str:
+        """获取主显示前缀（第一个）"""
+        prefixes = self._get_all_prefixes()
+        return prefixes[0] if prefixes else "/"
 
     def _register_commands(self):
         self.help_command_func = self._create_help_command()
@@ -99,6 +108,8 @@ class HelpModule(BaseModule):
             commands = self._build_command_list()
             module_config = self._get_config()
 
+            prefixes = self._get_all_prefixes()
+
             if args:
                 # 显示命令详情
                 try:
@@ -106,7 +117,9 @@ class HelpModule(BaseModule):
                     if index in self.command_map:
                         # 使用模板构建命令详情
                         templates = HelpTemplates.build_command_detail(
-                            self.command_map[index], self._get_command_prefix()
+                            self.command_map[index],
+                            self._get_command_prefix(),
+                            prefixes,
                         )
                     else:
                         # 使用错误模板
@@ -124,6 +137,7 @@ class HelpModule(BaseModule):
                     self.command_map,
                     self._get_command_prefix(),
                     module_config.get("group_commands", True),
+                    prefixes,
                 )
 
             # 根据平台能力选择最佳格式，通过 event.reply 发送
